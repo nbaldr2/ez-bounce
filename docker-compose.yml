@@ -14,6 +14,10 @@ services:
     image: ${REACHER_IMAGE:-reacherhq/backend:latest}
     container_name: ezd-reacher
     restart: unless-stopped
+    # Reacher can use Chromium for provider-specific checks. The default Docker
+    # /dev/shm is only 64 MB and causes renderer disconnects under concurrency.
+    # This VPS has 16 GB RAM; reserving 2 GB prevents that Chrome failure mode.
+    shm_size: '2gb'
     environment:
       # Listen on all interfaces *inside the container* so the app can reach it.
       RCH__HTTP_HOST: 0.0.0.0
