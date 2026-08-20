@@ -152,7 +152,8 @@ export async function verifyEmail(email: string): Promise<SmtpVerdict> {
   for (const mx of mxRecords.slice(0, 2)) {
     const host = mx.exchange.replace(/\.$/, '');
     const result = await verifyOnMx(host, email);
-    if (result.category !== 'unknown' || result.reason === 'ip_blocked') {
+    // Return on any definitive result, including temp-fails that will be retried
+    if (result.category !== 'unknown' || result.reason !== 'connection_error') {
       return result;
     }
   }
