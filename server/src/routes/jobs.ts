@@ -83,6 +83,7 @@ jobsRouter.get('/', (_req, res) => {
       createdAt: j.created_at,
       startedAt: j.started_at,
       finishedAt: j.finished_at,
+      filename: j.filename,
     })),
   });
 });

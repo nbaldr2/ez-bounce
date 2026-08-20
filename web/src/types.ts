@@ -17,6 +17,18 @@ export const PROVIDER_GROUPS: ProviderGroup[] = [
 
 export type JobStatus = 'queued' | 'running' | 'paused' | 'completed' | 'cancelled';
 
+/** Persisted job metadata used by the main list-history dashboard. */
+export interface JobListItem {
+  id: string;
+  uploadId: string;
+  filename: string;
+  status: JobStatus;
+  total: number;
+  createdAt: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
 export interface PrefilterReport {
   totalRows: number;
   emptyRows: number;

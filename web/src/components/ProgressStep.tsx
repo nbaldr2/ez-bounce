@@ -14,12 +14,14 @@ export function ProgressStep({
   onPause,
   onResume,
   onCancel,
+  onBack,
   busy,
 }: {
   status: JobStatusResponse;
   onPause: () => void;
   onResume: () => void;
   onCancel: () => void;
+  onBack: () => void;
   busy: boolean;
 }) {
   const { counts, total } = status;
@@ -35,6 +37,9 @@ export function ProgressStep({
       subtitle={`Job ${status.id.slice(0, 8)} · ${status.status}`}
       right={
         <div className="flex gap-2">
+          <Button variant="ghost" onClick={onBack}>
+            Back to lists
+          </Button>
           {running ? (
             <Button variant="ghost" onClick={onPause} disabled={busy}>
               Pause

@@ -27,7 +27,17 @@ const insertJob = db.prepare(`
 `);
 
 const selectJob = db.prepare('SELECT * FROM jobs WHERE id = ?');
-const selectJobs = db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?');
+const selectJobs = db.prepare(`
+  SELECT jobs.*, uploads.filename AS filename
+  FROM jobs
+  INNER JOIN uploads ON uploads.id = jobs.upload_id
+  ORDER BY jobs.created_at DESC
+  LIMIT ?
+`);
+
+export interface JobListRow extends JobRow {
+  filename: string;
+}
 
 export function createJob(args: {
   uploadId: string;
@@ -52,8 +62,8 @@ export function getJob(id: string): JobRow | undefined {
   return selectJob.get(id) as JobRow | undefined;
 }
 
-export function listJobs(limit = 25): JobRow[] {
-  return selectJobs.all(limit) as JobRow[];
+export function listJobs(limit = 25): JobListRow[] {
+  return selectJobs.all(limit) as JobListRow[];
 }
 
 export function setJobStatus(id: string, status: JobStatus): void {

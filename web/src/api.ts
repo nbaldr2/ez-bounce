@@ -2,6 +2,7 @@ import type {
   AnalyzeResponse,
   Category,
   HealthResponse,
+  JobListItem,
   JobStatusResponse,
   ProviderGroup,
   ResultRow,
@@ -83,6 +84,11 @@ export const api = {
 
   async jobStatus(jobId: string): Promise<JobStatusResponse> {
     return handle(await fetch(`/api/jobs/${jobId}/status`));
+  },
+
+  /** Persistent server-side history, newest list first. */
+  async jobs(): Promise<{ jobs: JobListItem[] }> {
+    return handle(await fetch('/api/jobs'));
   },
 
   async control(jobId: string, action: 'pause' | 'resume' | 'cancel'): Promise<void> {

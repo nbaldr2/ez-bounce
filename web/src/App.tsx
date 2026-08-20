@@ -10,15 +10,17 @@ import { UploadStep } from './components/UploadStep.tsx';
 import { PrefilterStep } from './components/PrefilterStep.tsx';
 import { ProgressStep } from './components/ProgressStep.tsx';
 import { ResultsDashboard } from './components/ResultsDashboard.tsx';
+import { JobDashboard } from './components/JobDashboard.tsx';
 import { SettingsPanel } from './components/SettingsPanel.tsx';
 import { Badge, Button, ErrorBanner } from './components/ui.tsx';
 
 type FilterOptions = { dropRole: boolean; dropDisposable: boolean; keepColumns: boolean };
+type View = 'lists' | 'new' | 'job';
 
 const POLL_MS = 2000;
-const JOB_KEY = 'ezd.activeJobId';
 
 export function App() {
+  const [view, setView] = useState<View>('lists');
   const [scan, setScan] = useState<UploadScan | null>(null);
   const [emailColumn, setEmailColumn] = useState<string>('');
   const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null);
@@ -38,32 +40,18 @@ export function App() {
 
   const pollRef = useRef<number | null>(null);
 
-  // Health is polled slowly; it's how the operator notices the Reacher sidecar
-  // died rather than every address mysteriously coming back unknown.
+  // Health is polled slowly; it shows immediately when the Reacher sidecar or
+  // Redis is unavailable without affecting the server-side verification job.
   useEffect(() => {
     const tick = () => void api.health().then(setHealth).catch(() => setHealth(null));
     tick();
-    const t = setInterval(tick, 15000);
-    return () => clearInterval(t);
+    const timer = window.setInterval(tick, 15_000);
+    return () => clearInterval(timer);
   }, []);
 
-  // Survive a page refresh mid-run: a 100k Gmail-heavy job can take hours.
+  /** Polls the selected job only. All jobs themselves continue in BullMQ/Redis. */
   useEffect(() => {
-    const saved = localStorage.getItem(JOB_KEY);
-    if (saved) {
-      api
-        .jobStatus(saved)
-        .then((s) => {
-          setJobId(s.id);
-          setStatus(s);
-        })
-        .catch(() => localStorage.removeItem(JOB_KEY));
-    }
-  }, []);
-
-  /** Polls /jobs/:id/status every 2s until the job reaches a terminal state. */
-  useEffect(() => {
-    if (!jobId) return;
+    if (view !== 'job' || !jobId) return;
 
     const stop = () => {
       if (pollRef.current !== null) {
@@ -74,9 +62,9 @@ export function App() {
 
     const tick = async () => {
       try {
-        const s = await api.jobStatus(jobId);
-        setStatus(s);
-        if (s.status === 'completed' || s.status === 'cancelled') stop();
+        const next = await api.jobStatus(jobId);
+        setStatus(next);
+        if (next.status === 'completed' || next.status === 'cancelled') stop();
       } catch (err) {
         setError((err as Error).message);
       }
@@ -85,7 +73,31 @@ export function App() {
     void tick();
     pollRef.current = window.setInterval(() => void tick(), POLL_MS);
     return stop;
-  }, [jobId]);
+  }, [jobId, view]);
+
+  const showLists = useCallback(() => {
+    setView('lists');
+    setJobId(null);
+    setStatus(null);
+    setError(null);
+  }, []);
+
+  const showNewList = useCallback(() => {
+    setScan(null);
+    setEmailColumn('');
+    setAnalysis(null);
+    setJobId(null);
+    setStatus(null);
+    setError(null);
+    setView('new');
+  }, []);
+
+  const selectJob = useCallback((id: string) => {
+    setJobId(id);
+    setStatus(null);
+    setError(null);
+    setView('job');
+  }, []);
 
   const runAnalyze = useCallback(
     async (uploadId: string, column: string, opts: FilterOptions) => {
@@ -104,10 +116,10 @@ export function App() {
   );
 
   const onUploadReady = useCallback(
-    (s: UploadScan, column: string) => {
-      setScan(s);
+    (nextScan: UploadScan, column: string) => {
+      setScan(nextScan);
       setEmailColumn(column);
-      void runAnalyze(s.uploadId, column, options);
+      void runAnalyze(nextScan.uploadId, column, options);
     },
     [options, runAnalyze],
   );
@@ -118,9 +130,9 @@ export function App() {
     setError(null);
     try {
       const { jobId: id } = await api.startJob(analysis.uploadId);
-      localStorage.setItem(JOB_KEY, id);
       setJobId(id);
       setStatus(null);
+      setView('job');
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -144,28 +156,18 @@ export function App() {
     [jobId],
   );
 
-  const reset = useCallback(() => {
-    localStorage.removeItem(JOB_KEY);
-    setScan(null);
-    setEmailColumn('');
-    setAnalysis(null);
-    setJobId(null);
-    setStatus(null);
-    setError(null);
-  }, []);
-
   const finished = status?.status === 'completed' || status?.status === 'cancelled';
   const hasProgress = status !== null && status.counts.done > 0;
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-8">
       <header className="mb-8 flex flex-wrap items-center justify-between gap-4">
-        <div>
+        <button onClick={showLists} className="text-left focus:outline-none focus:ring-2 focus:ring-emerald-500">
           <h1 className="text-2xl font-bold tracking-tight text-slate-50">ez-debounce</h1>
           <p className="mt-1 text-sm text-slate-400">
             Self-hosted bulk email verification · Reacher + rate-limited worker pools
           </p>
-        </div>
+        </button>
         <div className="flex items-center gap-3">
           {health && (
             <div className="flex items-center gap-1.5 text-xs">
@@ -176,6 +178,11 @@ export function App() {
                 redis {health.redis ? 'up' : 'down'}
               </Badge>
             </div>
+          )}
+          {view !== 'lists' && (
+            <Button variant="ghost" onClick={showLists}>
+              Lists
+            </Button>
           )}
           <Button variant="ghost" onClick={() => setSettingsOpen(true)}>
             Settings
@@ -198,16 +205,18 @@ export function App() {
       )}
 
       <div className="space-y-6">
-        {!jobId && (
+        {view === 'lists' && <JobDashboard onSelect={selectJob} onNewList={showNewList} />}
+
+        {view === 'new' && (
           <>
             <UploadStep onReady={onUploadReady} disabled={analysing} />
             {analysis && (
               <PrefilterStep
                 report={analysis.report}
                 options={options}
-                onOptionsChange={(o) => {
-                  setOptions(o);
-                  if (scan) void runAnalyze(scan.uploadId, emailColumn, o);
+                onOptionsChange={(nextOptions) => {
+                  setOptions(nextOptions);
+                  if (scan) void runAnalyze(scan.uploadId, emailColumn, nextOptions);
                 }}
                 onStart={() => void startJob()}
                 onReanalyze={() => {
@@ -220,24 +229,28 @@ export function App() {
           </>
         )}
 
-        {jobId && status && !finished && (
+        {view === 'job' && jobId && status && !finished && (
           <ProgressStep
             status={status}
             onPause={() => void control('pause')}
             onResume={() => void control('resume')}
             onCancel={() => void control('cancel')}
+            onBack={showLists}
             busy={controlBusy}
           />
         )}
 
-        {jobId && !status && (
-          <p className="rounded-lg border border-slate-800 bg-slate-900/60 p-6 text-sm text-slate-400">
-            Queueing addresses and resolving MX records…
-          </p>
+        {view === 'job' && jobId && !status && (
+          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-6 text-sm text-slate-400">
+            <p>Loading job status and queue progress…</p>
+            <Button variant="ghost" onClick={showLists} className="mt-4">
+              Back to lists
+            </Button>
+          </div>
         )}
 
-        {jobId && status && (finished || hasProgress) && (
-          <ResultsDashboard status={status} onReset={reset} />
+        {view === 'job' && jobId && status && (finished || hasProgress) && (
+          <ResultsDashboard status={status} onBack={showLists} />
         )}
       </div>
 

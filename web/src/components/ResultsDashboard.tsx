@@ -18,10 +18,10 @@ const PAGE = 50;
 /** Step 4 + 5: results dashboard with a filterable table and CSV export. */
 export function ResultsDashboard({
   status,
-  onReset,
+  onBack,
 }: {
   status: JobStatusResponse;
-  onReset: () => void;
+  onBack: () => void;
 }) {
   const jobId = status.id;
   const { counts } = status;
@@ -101,8 +101,8 @@ export function ResultsDashboard({
             : `Job is ${status.status} — showing what has been verified so far`
         }
         right={
-          <Button variant="ghost" onClick={onReset}>
-            New list
+          <Button variant="ghost" onClick={onBack}>
+            Back to lists
           </Button>
         }
       >
