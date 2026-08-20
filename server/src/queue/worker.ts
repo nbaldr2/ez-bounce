@@ -1,14 +1,8 @@
 import { Worker, type Job } from 'bullmq';
 import { createQueueConnection } from '../redis.js';
 import { getSettings } from '../settings.js';
-import { classify } from '../lib/classify.js';
 import { acquireSlot } from '../lib/pacer.js';
-import {
-  ReacherHttpError,
-  ReacherUnavailableError,
-  checkEmail,
-  type ReacherResponse,
-} from '../lib/reacher.js';
+import { verifyEmail } from '../lib/smtp-verify.js';
 import {
   getJob,
   incrTempFailEvents,
@@ -51,61 +45,17 @@ async function process(job: Job<VerifyJobData>): Promise<void> {
   // sit in the pacer long after the operator hit stop.
   if (await isCancelled(jobId)) return;
 
-  let response: ReacherResponse | null = null;
-  let transportError: { reason: Reason; message: string } | null = null;
+  // ---- direct SMTP verification ------------------------------------------
+  //
+  // Opens EHLO → MAIL FROM → RCPT TO on the target MX. No sidecar, no
+  // headless Chrome: just the SMTP conversation that every verifier ultimately
+  // performs. This replaces the Reacher HTTP call because the reacherhq/backend
+  // image routes Microsoft/Yahoo through a headless Chrome instance that
+  // reliably crashes in Docker, returning `unknown` for every address.
+  const result = await verifyEmail(email);
 
-  try {
-    response = await checkEmail(email, settings.reacherTimeoutMs);
-  } catch (err) {
-    if (err instanceof ReacherUnavailableError) {
-      // Timeout or connection failure to the sidecar: says nothing about the
-      // address, so retry.
-      transportError = { reason: 'connection_error', message: err.message };
-    } else if (err instanceof ReacherHttpError) {
-      if (err.status === 429 || err.status >= 500) {
-        transportError = { reason: 'connection_error', message: `${err.message}: ${err.body}` };
-      } else {
-        // 4xx from Reacher's own API (bad request, missing licence, bad secret)
-        // is a configuration bug, not a mailbox verdict. Surface it loudly and
-        // do not burn retries.
-        console.error(`[worker:${group}] Reacher rejected the request: ${err.message} ${err.body}`);
-        transportError = { reason: 'reacher_error', message: `${err.message}: ${err.body}` };
-      }
-    } else {
-      transportError = { reason: 'connection_error', message: (err as Error).message };
-    }
-  }
-
-  // ---- transport-level failure -------------------------------------------
-  if (transportError) {
-    const permanent = transportError.reason === 'reacher_error';
-    if (!permanent && attempt < maxAttempts) {
-      const delayMs = settings.retryBackoffMs[attempt - 1] ?? settings.retryBackoffMs.at(-1) ?? 30_000;
-      await incrTempFailEvents(jobId);
-      await requeueWithBackoff(job.data, attempt + 1, delayMs);
-      return;
-    }
-    await recordResult({
-      jobId,
-      email,
-      domain,
-      group,
-      category: 'unknown',
-      reason: permanent ? 'reacher_error' : 'temp_fail_exhausted',
-      reacherStatus: null,
-      attempts: attempt,
-      smtpCode: null,
-      message: transportError.message,
-      raw: null,
-    });
-    await maybeComplete(jobId);
-    return;
-  }
-
-  // ---- classify the response ---------------------------------------------
-  const verdict = classify(response!, settings);
-
-  if (verdict.kind === 'temp_fail') {
+  // ---- temp-fail (4xx) — retry with backoff --------------------------------
+  if (result.reason === 'greylisted' || result.reason === 'connection_error') {
     await incrTempFailEvents(jobId);
 
     if (attempt < maxAttempts) {
@@ -114,37 +64,33 @@ async function process(job: Job<VerifyJobData>): Promise<void> {
       return;
     }
 
-    // Backoff schedule exhausted. Record as `unknown`, never `invalid` — we
-    // still have no evidence about this mailbox.
+    // Backoff exhausted: record as unknown, never invalid.
     await recordResult({
-      jobId,
-      email,
-      domain,
-      group,
+      jobId, email, domain, group,
       category: 'unknown',
       reason: 'temp_fail_exhausted',
-      reacherStatus: typeof response!.is_reachable === 'string' ? response!.is_reachable : null,
+      reacherStatus: null,
       attempts: attempt,
-      smtpCode: verdict.smtpCode,
-      message: verdict.message,
-      raw: response,
+      smtpCode: result.smtpCode,
+      message: result.message,
+      raw: null,
     });
     await maybeComplete(jobId);
     return;
   }
 
+  // ---- terminal verdict ----------------------------------------------------
   await recordResult({
-    jobId,
-    email,
-    domain,
-    group,
-    category: verdict.category,
-    reason: verdict.reason,
-    reacherStatus: typeof response!.is_reachable === 'string' ? response!.is_reachable : null,
+    jobId, email, domain, group,
+    category: result.category === 'valid' ? 'valid' :
+              result.category === 'invalid' ? 'invalid' :
+              result.category === 'catch_all' ? 'catch_all' : 'unknown',
+    reason: result.reason as Reason,
+    reacherStatus: null,
     attempts: attempt,
-    smtpCode: verdict.smtpCode,
-    message: verdict.message,
-    raw: response,
+    smtpCode: result.smtpCode,
+    message: result.message,
+    raw: null,
   });
   await maybeComplete(jobId);
 }
