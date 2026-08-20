@@ -55,9 +55,11 @@ async function verifyOnMx(host: string, email: string): Promise<SmtpVerdict> {
         const code = parseInt(line.slice(0, 3), 10) || 0;
 
         if (stage === 0) {
-          // Banner
-          if (code >= 500) {
-            return fail(code, 'connection_error', line);
+          // Banner — any 4xx or 5xx means the IP is blocked or throttled
+          if (code >= 400) {
+            const lower = line.toLowerCase();
+            const temp = code >= 400 && code < 500;
+            return fail(code, temp ? 'greylisted' : 'connection_error', line);
           }
           stage = 1;
           send(`EHLO ${HELO}`);
