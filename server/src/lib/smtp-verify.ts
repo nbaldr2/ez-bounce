@@ -49,38 +49,46 @@ async function verifyOnMx(host: string, email: string): Promise<SmtpVerdict> {
         const line = buf.slice(0, nl).trim();
         buf = buf.slice(nl + 1);
 
-        // Skip intermediate multiline EHLO responses
-        if (line.length >= 4 && line[3] === '-') {
-          stage = 2;
-          continue;
-        }
+        // Skip intermediate multiline replies (code followed by '-')
+        if (line.length >= 4 && line[3] === '-') continue;
 
-        const code = parseInt(line.slice(0, 3), 10);
-        if (!Number.isFinite(code)) continue;
+        const code = parseInt(line.slice(0, 3), 10) || 0;
 
         if (stage === 0) {
           // Banner
+          if (NODE_ENV !== 'production') console.log('[smtp] banner:', line);
           if (code >= 500) {
             return fail(code, 'connection_error', line);
           }
           stage = 1;
           send(`EHLO ${HELO}`);
-        } else if (stage === 1 || stage === 2) {
-          // EHLO response — send MAIL FROM
-          stage = 3;
-          send(`MAIL FROM:<${FROM_ADDR}>`);
-        } else if (stage === 3) {
-          // MAIL FROM response
+        } else if (stage === 1) {
+          const lower = line.toLowerCase();
           if (code >= 500) {
-            return fail(code, 'ip_blocked', line);
+            if (lower.includes('block') || lower.includes('ptr') || lower.includes('rdns')) {
+              return fail(code, 'ip_blocked', line);
+            }
+            return fail(code, 'connection_error', line);
+          }
+          if (code >= 200 && code < 300) {
+            // Final EHLO response line — send MAIL FROM
+            stage = 2;
+            send(`MAIL FROM:<${FROM_ADDR}>`);
+          }
+        } else if (stage === 2) {
+          if (code >= 500) {
+            const lower = line.toLowerCase();
+            if (lower.includes('block') || lower.includes('ptr') || lower.includes('rdns') || lower.includes('3150') || lower.includes('block list')) {
+              return fail(code, 'ip_blocked', line);
+            }
+            return fail(code, 'connection_error', line);
           }
           if (code >= 400) {
             return fail(code, 'greylisted', line);
           }
-          stage = 4;
+          stage = 3;
           send(`RCPT TO:<${email}>`);
-        } else if (stage === 4) {
-          // RCPT TO response — terminal verdict
+        } else if (stage === 3) {
           if (timer) { clearTimeout(timer); timer = null; }
           send('QUIT');
           socket.end();
@@ -89,15 +97,13 @@ async function verifyOnMx(host: string, email: string): Promise<SmtpVerdict> {
             resolve({ category: 'valid', reason: 'deliverable', smtpCode: code, message: line });
           } else if (code >= 400 && code < 500) {
             resolve({ category: 'unknown', reason: 'greylisted', smtpCode: code, message: line });
-          } else if (code >= 500) {
+          } else {
             const lower = line.toLowerCase();
             if (lower.includes('user unknown') || lower.includes('no such') || lower.includes('not found') || lower.includes('does not exist')) {
               resolve({ category: 'invalid', reason: 'rejected', smtpCode: code, message: line });
             } else {
               resolve({ category: 'invalid', reason: 'rejected', smtpCode: code, message: line });
             }
-          } else {
-            resolve({ category: 'unknown', reason: 'unknown', smtpCode: code, message: line });
           }
         }
       }
