@@ -56,7 +56,6 @@ async function verifyOnMx(host: string, email: string): Promise<SmtpVerdict> {
 
         if (stage === 0) {
           // Banner
-          if (NODE_ENV !== 'production') console.log('[smtp] banner:', line);
           if (code >= 500) {
             return fail(code, 'connection_error', line);
           }
