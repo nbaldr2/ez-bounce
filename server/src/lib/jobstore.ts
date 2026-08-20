@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { db, type JobRow } from '../db.js';
+import { execute, query, type JobRow } from '../db.js';
 import { keys, redis } from '../redis.js';
 import { getSettings } from '../settings.js';
 import { allGroupCounts, getQueue } from '../queue/queues.js';
@@ -17,182 +17,125 @@ import type {
 } from '../types.js';
 import { CATEGORIES, PROVIDER_GROUPS } from '../types.js';
 
-// ---------------------------------------------------------------------------
-// Job lifecycle
-// ---------------------------------------------------------------------------
-
-const insertJob = db.prepare(`
-  INSERT INTO jobs (id, upload_id, status, total, created_at, settings_json, prefilter_json)
-  VALUES (@id, @upload_id, @status, @total, @created_at, @settings_json, @prefilter_json)
-`);
-
-const selectJob = db.prepare('SELECT * FROM jobs WHERE id = ?');
-const selectJobs = db.prepare(`
-  SELECT jobs.*, uploads.filename AS filename
-  FROM jobs
-  INNER JOIN uploads ON uploads.id = jobs.upload_id
-  ORDER BY jobs.created_at DESC
-  LIMIT ?
-`);
-
 export interface JobListRow extends JobRow {
   filename: string;
 }
 
-export function createJob(args: {
+export async function createJob(args: {
   uploadId: string;
   total: number;
   settings: Settings;
   prefilter: PrefilterReport | null;
-}): string {
+}): Promise<string> {
   const id = randomUUID();
-  insertJob.run({
-    id,
-    upload_id: args.uploadId,
-    status: 'queued' satisfies JobStatus,
-    total: args.total,
-    created_at: Date.now(),
-    settings_json: JSON.stringify(args.settings),
-    prefilter_json: args.prefilter ? JSON.stringify(args.prefilter) : null,
-  });
+  await execute(
+    `INSERT INTO jobs (id, upload_id, status, total, created_at, settings_json, prefilter_json)
+     VALUES ($1, $2, 'queued', $3, $4, $5, $6)`,
+    [id, args.uploadId, args.total, Date.now(), JSON.stringify(args.settings), args.prefilter ? JSON.stringify(args.prefilter) : null],
+  );
   return id;
 }
 
-export function getJob(id: string): JobRow | undefined {
-  return selectJob.get(id) as JobRow | undefined;
+export async function getJob(id: string): Promise<JobRow | undefined> {
+  const [job] = await query<JobRow>('SELECT * FROM jobs WHERE id = $1', [id]);
+  return job;
 }
 
-export function listJobs(limit = 25): JobListRow[] {
-  return selectJobs.all(limit) as JobListRow[];
+export async function listJobs(limit = 25): Promise<JobListRow[]> {
+  return query<JobListRow>(
+    `SELECT jobs.*, uploads.filename AS filename
+     FROM jobs INNER JOIN uploads ON uploads.id = jobs.upload_id
+     ORDER BY jobs.created_at DESC LIMIT $1`,
+    [limit],
+  );
 }
 
-export function setJobStatus(id: string, status: JobStatus): void {
+export async function setJobStatus(id: string, status: JobStatus): Promise<void> {
   const now = Date.now();
   if (status === 'running') {
-    db.prepare(
-      "UPDATE jobs SET status = ?, started_at = COALESCE(started_at, ?) WHERE id = ?",
-    ).run(status, now, id);
+    await execute(
+      'UPDATE jobs SET status = $1, started_at = COALESCE(started_at, $2) WHERE id = $3',
+      [status, now, id],
+    );
   } else if (status === 'completed' || status === 'cancelled') {
-    db.prepare('UPDATE jobs SET status = ?, finished_at = ? WHERE id = ?').run(status, now, id);
+    await execute('UPDATE jobs SET status = $1, finished_at = $2 WHERE id = $3', [status, now, id]);
   } else {
-    db.prepare('UPDATE jobs SET status = ? WHERE id = ?').run(status, id);
+    await execute('UPDATE jobs SET status = $1 WHERE id = $2', [status, id]);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Enqueueing
-// ---------------------------------------------------------------------------
-
 /**
- * Resolves provider pools for every distinct domain in the upload, then bulk
- * adds one job per address to its pool's queue.
- *
- * MX resolution is per *domain*, bounded to 20 concurrent lookups: a 100k list
- * of Gmail addresses costs exactly one DNS query, and even a long-tail B2B list
- * usually resolves in a few seconds.
+ * Streams candidates in pages. We intentionally resolve MX hosts only for the
+ * current page: PostgreSQL/Redis cache the domain result, so a 10M-domain
+ * long-tail list never creates a 10M-entry JavaScript Map.
  */
 export async function enqueueJob(jobId: string): Promise<void> {
-  const job = getJob(jobId);
+  const job = await getJob(jobId);
   if (!job) throw new Error(`Job ${jobId} not found`);
 
-  // Distinct domains only: a 100k Gmail list is a single DNS query.
-  const domains = (
-    db
-      .prepare('SELECT DISTINCT domain FROM candidates WHERE upload_id = ?')
-      .all(job.upload_id) as Array<{ domain: string }>
-  ).map((r) => r.domain);
-
-  const groupByDomain = new Map<string, ProviderGroup>();
-
-  const CONCURRENCY = 20;
-  let cursor = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(CONCURRENCY, domains.length) }, async () => {
-      for (;;) {
-        const i = cursor++;
-        if (i >= domains.length) return;
-        const d = domains[i]!;
-        try {
-          const res = await resolveGroup(d);
-          groupByDomain.set(d, res.group);
-        } catch {
-          groupByDomain.set(d, 'other');
-        }
-      }
-    }),
-  );
-
-  setJobStatus(jobId, 'running');
+  await setJobStatus(jobId, 'running');
   await redis.del(keys.jobCancelled(jobId));
 
-  // Buffer per pool, flushing in chunks so we never build a 100k-element array.
   const buffers = new Map<ProviderGroup, Array<{ name: string; data: VerifyJobData; opts: object }>>();
   const CHUNK = 1_000;
+  const PAGE = 1_000;
 
   const flush = async (group: ProviderGroup, force = false) => {
-    const buf = buffers.get(group);
-    if (!buf || buf.length === 0) return;
-    if (!force && buf.length < CHUNK) return;
-    await getQueue(group).addBulk(buf);
+    const items = buffers.get(group);
+    if (!items || items.length === 0 || (!force && items.length < CHUNK)) return;
+    await getQueue(group).addBulk(items);
     buffers.set(group, []);
   };
 
-  /**
-   * Read the candidates in keyset-paginated pages rather than holding a
-   * `.iterate()` cursor open.
-   *
-   * better-sqlite3 uses one synchronous connection: an open read cursor that
-   * survives an `await` will collide with a worker writing a result on the same
-   * connection ("This database connection is busy executing a query"). Paging
-   * with `.all()` keeps every statement confined to a single tick while still
-   * never materialising the whole list.
-   */
-  const page = db.prepare(
-    `SELECT email, domain FROM candidates
-     WHERE upload_id = ? AND email > ?
-     ORDER BY email LIMIT ?`,
-  );
-
   let after = '';
   for (;;) {
-    const rows = page.all(job.upload_id, after, CHUNK) as Array<{
-      email: string;
-      domain: string;
-    }>;
+    const rows = await query<{ email: string; domain: string }>(
+      `SELECT email, domain FROM candidates
+       WHERE upload_id = $1 AND email > $2
+       ORDER BY email LIMIT $3`,
+      [job.upload_id, after, PAGE],
+    );
     if (rows.length === 0) break;
+
+    const groupByDomain = new Map<string, ProviderGroup>();
+    let cursor = 0;
+    const DNS_CONCURRENCY = Math.min(20, rows.length);
+    await Promise.all(
+      Array.from({ length: DNS_CONCURRENCY }, async () => {
+        for (;;) {
+          const index = cursor++;
+          if (index >= rows.length) return;
+          const domain = rows[index]!.domain;
+          let group: ProviderGroup = 'other';
+          try {
+            group = (await resolveGroup(domain)).group;
+          } catch {
+            // Reacher will independently report no-MX/DNS failures.
+          }
+          groupByDomain.set(domain, group);
+        }
+      }),
+    );
 
     for (const row of rows) {
       const group = groupByDomain.get(row.domain) ?? 'other';
-      const data: VerifyJobData = {
-        jobId,
-        email: row.email,
-        domain: row.domain,
-        group,
-        attempt: 1,
-      };
-      const list = buffers.get(group) ?? [];
-      list.push({
+      const data: VerifyJobData = { jobId, email: row.email, domain: row.domain, group, attempt: 1 };
+      const items = buffers.get(group) ?? [];
+      items.push({
         name: 'verify',
         data,
-        // Deterministic id makes re-enqueueing the same job idempotent.
         opts: { jobId: `${jobId}:${row.email}:1` },
       });
-      buffers.set(group, list);
+      buffers.set(group, items);
     }
 
     after = rows[rows.length - 1]!.email;
-
-    for (const group of PROVIDER_GROUPS) {
-      await flush(group);
-    }
+    await Promise.all(PROVIDER_GROUPS.map((group) => flush(group)));
   }
 
-  for (const group of PROVIDER_GROUPS) {
-    await flush(group, true);
-  }
+  await Promise.all(PROVIDER_GROUPS.map((group) => flush(group, true)));
 }
 
-/** Re-enqueues one address after a temp-fail, with the configured backoff. */
 export async function requeueWithBackoff(
   data: VerifyJobData,
   nextAttempt: number,
@@ -204,32 +147,6 @@ export async function requeueWithBackoff(
     { delay: delayMs, jobId: `${data.jobId}:${data.email}:${nextAttempt}` },
   );
 }
-
-// ---------------------------------------------------------------------------
-// Results + counters
-// ---------------------------------------------------------------------------
-
-const insertResult = db.prepare(`
-  INSERT OR IGNORE INTO results
-    (job_id, email, domain, provider_group, category, reason, reacher_status,
-     attempts, smtp_code, message, updated_at, raw_json)
-  VALUES
-    (@job_id, @email, @domain, @provider_group, @category, @reason, @reacher_status,
-     @attempts, @smtp_code, @message, @updated_at, @raw_json)
-`);
-
-const updateResult = db.prepare(`
-  UPDATE results SET
-    category = @category,
-    reason = @reason,
-    reacher_status = @reacher_status,
-    attempts = @attempts,
-    smtp_code = @smtp_code,
-    message = @message,
-    updated_at = @updated_at,
-    raw_json = @raw_json
-  WHERE job_id = @job_id AND email = @email
-`);
 
 export interface RecordResultArgs {
   jobId: string;
@@ -246,51 +163,52 @@ export interface RecordResultArgs {
 }
 
 /**
- * Persists a terminal verdict and bumps the live counters.
- *
- * SQLite is the source of truth; the Redis hash exists purely so the 2s status
- * poll is O(1) instead of a GROUP BY over 100k rows.
- *
- * The insert-then-update split matters for correctness. If a worker dies
- * mid-check, BullMQ eventually reclaims the job as stalled and another worker
- * reprocesses it — so the same address can legitimately produce two results.
- * `INSERT OR IGNORE` tells us whether the row was genuinely new, and the
- * counters are only incremented in that case. A plain UPSERT would report
- * `changes === 1` either way and silently inflate the totals past the job size,
- * which would also stop `maybeComplete` from ever firing correctly.
+ * `ON CONFLICT DO NOTHING RETURNING` preserves exact progress counters when a
+ * stalled BullMQ task is delivered again. PostgreSQL is durable truth; Redis is
+ * the low-latency status cache.
  */
 export async function recordResult(args: RecordResultArgs): Promise<void> {
-  const params = {
-    job_id: args.jobId,
-    email: args.email,
-    domain: args.domain,
-    provider_group: args.group,
-    category: args.category,
-    reason: args.reason,
-    reacher_status: args.reacherStatus,
-    attempts: args.attempts,
-    smtp_code: args.smtpCode,
-    message: args.message ? args.message.slice(0, 1_000) : null,
-    updated_at: Date.now(),
-    raw_json: args.raw ? JSON.stringify(args.raw).slice(0, 8_000) : null,
-  };
+  const values = [
+    args.jobId,
+    args.email,
+    args.domain,
+    args.group,
+    args.category,
+    args.reason,
+    args.reacherStatus,
+    args.attempts,
+    args.smtpCode,
+    args.message ? args.message.slice(0, 1_000) : null,
+    Date.now(),
+    args.raw ? JSON.stringify(args.raw).slice(0, 8_000) : null,
+  ];
+  const inserted = await query<{ email: string }>(
+    `INSERT INTO results
+       (job_id, email, domain, provider_group, category, reason, reacher_status,
+        attempts, smtp_code, message, updated_at, raw_json)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+     ON CONFLICT (job_id, email) DO NOTHING
+     RETURNING email`,
+    values,
+  );
 
-  const info = insertResult.run(params);
-  const isNew = info.changes === 1;
-
-  if (!isNew) {
-    // Redelivery of an address we already scored. Keep the newer verdict but
-    // leave the counters alone.
-    updateResult.run(params);
+  if (inserted.length === 0) {
+    await execute(
+      `UPDATE results SET category = $5, reason = $6, reacher_status = $7,
+         attempts = $8, smtp_code = $9, message = $10, updated_at = $11, raw_json = $12
+       WHERE job_id = $1 AND email = $2`,
+      values,
+    );
     return;
   }
 
   try {
-    await redis.hincrby(keys.jobCounts(args.jobId), args.category, 1);
-    await redis.hincrby(keys.jobCounts(args.jobId), 'done', 1);
+    const pipeline = redis.pipeline();
+    pipeline.hincrby(keys.jobCounts(args.jobId), args.category, 1);
+    pipeline.hincrby(keys.jobCounts(args.jobId), 'done', 1);
+    await pipeline.exec();
   } catch {
-    // Counters are advisory; the dashboard reconciles from SQLite when the job
-    // finishes.
+    // PostgreSQL reconciles any lost Redis counter at job completion.
   }
 }
 
@@ -302,17 +220,17 @@ export async function incrTempFailEvents(jobId: string): Promise<void> {
   }
 }
 
-/** Authoritative counts straight from SQLite. */
-export function countsFromDb(jobId: string): Record<Category, number> & { done: number } {
-  const rows = db
-    .prepare('SELECT category, COUNT(*) AS n FROM results WHERE job_id = ? GROUP BY category')
-    .all(jobId) as Array<{ category: Category | null; n: number }>;
-
+export async function countsFromDb(jobId: string): Promise<Record<Category, number> & { done: number }> {
+  const rows = await query<{ category: Category | null; n: number }>(
+    `SELECT category, COUNT(*)::bigint AS n FROM results
+     WHERE job_id = $1 GROUP BY category`,
+    [jobId],
+  );
   const out = { valid: 0, invalid: 0, catch_all: 0, unknown: 0, done: 0 };
-  for (const r of rows) {
-    if (r.category && CATEGORIES.includes(r.category)) {
-      out[r.category] = r.n;
-      out.done += r.n;
+  for (const row of rows) {
+    if (row.category && CATEGORIES.includes(row.category)) {
+      out[row.category] = row.n;
+      out.done += row.n;
     }
   }
   return out;
@@ -320,11 +238,11 @@ export function countsFromDb(jobId: string): Record<Category, number> & { done: 
 
 async function redisCounts(jobId: string): Promise<Record<string, number>> {
   try {
-    const h = await redis.hgetall(keys.jobCounts(jobId));
+    const hash = await redis.hgetall(keys.jobCounts(jobId));
     const out: Record<string, number> = {};
-    for (const [k, v] of Object.entries(h)) {
-      const n = Number.parseInt(v, 10);
-      if (Number.isFinite(n)) out[k] = n;
+    for (const [key, value] of Object.entries(hash)) {
+      const number = Number.parseInt(value, 10);
+      if (Number.isFinite(number)) out[key] = number;
     }
     return out;
   } catch {
@@ -342,63 +260,49 @@ export async function isCancelled(jobId: string): Promise<boolean> {
 
 export async function cancelJob(jobId: string): Promise<void> {
   await redis.set(keys.jobCancelled(jobId), '1', 'EX', 7 * 24 * 60 * 60);
-  setJobStatus(jobId, 'cancelled');
+  await setJobStatus(jobId, 'cancelled');
 }
 
-/**
- * Marks a job completed once every address has a terminal verdict.
- * Called after each result; cheap because it reads the Redis counter first.
- */
 export async function maybeComplete(jobId: string): Promise<void> {
-  const job = getJob(jobId);
+  const job = await getJob(jobId);
   if (!job || job.status === 'completed' || job.status === 'cancelled') return;
 
-  const rc = await redisCounts(jobId);
-  if ((rc.done ?? 0) < job.total) return;
+  const cached = await redisCounts(jobId);
+  if ((cached.done ?? 0) < job.total) return;
 
-  // Confirm against SQLite before declaring victory.
-  const authoritative = countsFromDb(jobId);
-  if (authoritative.done >= job.total) {
-    setJobStatus(jobId, 'completed');
-    // Re-sync the Redis hash so the final dashboard render is exact.
-    try {
-      await redis.hset(keys.jobCounts(jobId), {
-        valid: authoritative.valid,
-        invalid: authoritative.invalid,
-        catch_all: authoritative.catch_all,
-        unknown: authoritative.unknown,
-        done: authoritative.done,
-      });
-    } catch {
-      /* advisory */
-    }
+  const authoritative = await countsFromDb(jobId);
+  if (authoritative.done < job.total) return;
+
+  await setJobStatus(jobId, 'completed');
+  try {
+    await redis.hset(keys.jobCounts(jobId), {
+      valid: authoritative.valid,
+      invalid: authoritative.invalid,
+      catch_all: authoritative.catch_all,
+      unknown: authoritative.unknown,
+      done: authoritative.done,
+    });
+  } catch {
+    /* advisory */
   }
 }
 
-// ---------------------------------------------------------------------------
-// Status assembly
-// ---------------------------------------------------------------------------
-
 export async function jobStatus(jobId: string): Promise<JobStatusResponse | null> {
-  const job = getJob(jobId);
+  const job = await getJob(jobId);
   if (!job) return null;
 
   const settings = await getSettings();
-  const [rc, qc] = await Promise.all([redisCounts(jobId), allGroupCounts()]);
-
+  const [cached, queues] = await Promise.all([redisCounts(jobId), allGroupCounts()]);
   const finished = job.status === 'completed' || job.status === 'cancelled';
-  // Trust SQLite once the run is over (or if Redis counters were lost).
-  const authoritative = finished || Object.keys(rc).length === 0 ? countsFromDb(jobId) : null;
+  const authoritative = finished || Object.keys(cached).length === 0 ? await countsFromDb(jobId) : null;
 
-  const valid = authoritative?.valid ?? rc.valid ?? 0;
-  const invalid = authoritative?.invalid ?? rc.invalid ?? 0;
-  const catchAll = authoritative?.catch_all ?? rc.catch_all ?? 0;
-  const unknown = authoritative?.unknown ?? rc.unknown ?? 0;
-  const done = authoritative?.done ?? rc.done ?? 0;
-
-  // Queue depth is global; attribute only this job's share of it.
-  const delayed = PROVIDER_GROUPS.reduce((n, g) => n + qc[g].delayed, 0);
-  const active = PROVIDER_GROUPS.reduce((n, g) => n + qc[g].active, 0);
+  const valid = authoritative?.valid ?? cached.valid ?? 0;
+  const invalid = authoritative?.invalid ?? cached.invalid ?? 0;
+  const catchAll = authoritative?.catch_all ?? cached.catch_all ?? 0;
+  const unknown = authoritative?.unknown ?? cached.unknown ?? 0;
+  const done = authoritative?.done ?? cached.done ?? 0;
+  const delayed = PROVIDER_GROUPS.reduce((count, group) => count + queues[group].delayed, 0);
+  const active = PROVIDER_GROUPS.reduce((count, group) => count + queues[group].active, 0);
 
   const counts: JobCounts = {
     valid,
@@ -406,17 +310,15 @@ export async function jobStatus(jobId: string): Promise<JobStatusResponse | null
     catch_all: catchAll,
     unknown,
     done,
-    tempFailEvents: rc.tempFailEvents ?? 0,
+    tempFailEvents: cached.tempFailEvents ?? 0,
     retryPending: delayed,
     pending: Math.max(0, job.total - done),
     active,
   };
-
   const startedAt = job.started_at;
   const endRef = job.finished_at ?? Date.now();
-  const elapsedSec = startedAt ? Math.max(0.001, (endRef - startedAt) / 1000) : 0;
-  const rate = elapsedSec > 0 ? done / elapsedSec : 0;
-  const etaSeconds = rate > 0 && counts.pending > 0 ? Math.round(counts.pending / rate) : null;
+  const elapsedSeconds = startedAt ? Math.max(0.001, (endRef - startedAt) / 1000) : 0;
+  const rate = elapsedSeconds > 0 ? done / elapsedSeconds : 0;
 
   return {
     id: job.id,
@@ -428,16 +330,16 @@ export async function jobStatus(jobId: string): Promise<JobStatusResponse | null
     startedAt: job.started_at,
     finishedAt: job.finished_at,
     rate: Number(rate.toFixed(2)),
-    etaSeconds,
+    etaSeconds: rate > 0 && counts.pending > 0 ? Math.round(counts.pending / rate) : null,
     prefilter: job.prefilter_json ? (JSON.parse(job.prefilter_json) as PrefilterReport) : null,
-    perGroup: PROVIDER_GROUPS.map((g) => ({
-      group: g,
-      waiting: qc[g].waiting,
-      active: qc[g].active,
-      delayed: qc[g].delayed,
-      concurrency: settings.groups[g].concurrency,
-      delayMs: settings.groups[g].delayMs,
-      paused: qc[g].paused,
+    perGroup: PROVIDER_GROUPS.map((group) => ({
+      group,
+      waiting: queues[group].waiting,
+      active: queues[group].active,
+      delayed: queues[group].delayed,
+      concurrency: settings.groups[group].concurrency,
+      delayMs: settings.groups[group].delayMs,
+      paused: queues[group].paused,
     })),
   };
 }

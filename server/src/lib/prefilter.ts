@@ -260,7 +260,10 @@ export interface PrefilterOptions {
 
 export interface KeptAddress {
   email: string;
+  /** Canonical mailbox key enforced by PostgreSQL per upload. */
+  dedupeKey: string;
   domain: string;
+  group: ProviderGroup;
   row: Record<string, string> | null;
 }
 
@@ -278,8 +281,8 @@ export interface RejectedAddress {
  * *unique* addresses (the dedupe set) rather than on the full row payloads.
  */
 export interface PrefilterSink {
-  keep(batch: KeptAddress[]): void;
-  reject(batch: RejectedAddress[]): void;
+  keep(batch: KeptAddress[]): Promise<{ inserted: number; duplicates: RejectedAddress[] }>;
+  reject(batch: RejectedAddress[]): Promise<void>;
 }
 
 const SINK_BATCH = 5_000;
@@ -291,9 +294,9 @@ export interface PrefilterOutcome {
 /**
  * Streams the whole file and partitions it into kept vs rejected.
  *
- * Order of checks matters and is deliberate: syntax before dedupe (so garbage
- * cells never occupy a dedupe slot), dedupe before role/disposable (so counts
- * describe unique mailboxes rather than raw rows).
+ * Cheap local exclusions happen first; accepted candidates are then deduped by
+ * PostgreSQL. That keeps memory bounded even when a 10M-row file contains only
+ * role/disposable addresses and therefore produces very few candidate batches.
  */
 export async function prefilterCsv(
   filePath: string,
@@ -316,27 +319,33 @@ export async function prefilterCsv(
     groupCounts: {},
   };
 
-  const seen = new Set<string>();
   let kept: KeptAddress[] = [];
   let rejected: RejectedAddress[] = [];
-  const domainCounts = new Map<string, number>();
-  const groupCounts = new Map<ProviderGroup, number>();
+  // PostgreSQL owns global dedupe. This only avoids duplicate keys inside the
+  // current bounded batch before the database insert happens.
+  let batchDedupe = new Set<string>();
 
-  const flushKept = (force = false) => {
+  const flushKept = async (force = false) => {
     if (kept.length >= SINK_BATCH || (force && kept.length > 0)) {
-      sink.keep(kept);
+      const batch = kept;
       kept = [];
+      batchDedupe = new Set<string>();
+      const outcome = await sink.keep(batch);
+      report.kept += outcome.inserted;
+      report.duplicate += outcome.duplicates.length;
+      if (outcome.duplicates.length > 0) await sink.reject(outcome.duplicates);
     }
   };
-  const flushRejected = (force = false) => {
+  const flushRejected = async (force = false) => {
     if (rejected.length >= SINK_BATCH || (force && rejected.length > 0)) {
-      sink.reject(rejected);
+      const batch = rejected;
       rejected = [];
+      await sink.reject(batch);
     }
   };
 
-  await new Promise<void>((resolve, reject) => {
-    const parser = parse({
+  const parser = fs.createReadStream(filePath).pipe(
+    parse({
       delimiter: opts.delimiter,
       columns: false,
       relax_column_count: true,
@@ -344,90 +353,77 @@ export async function prefilterCsv(
       skip_empty_lines: true,
       bom: true,
       from_line: opts.headerless ? 1 : 2,
+    }),
+  );
+
+  for await (const rec of parser as AsyncIterable<string[]>) {
+    report.totalRows += 1;
+    const cell = rec[emailIdx];
+
+    if (cell === undefined || cell.trim() === '') {
+      report.emptyRows += 1;
+      continue;
+    }
+
+    const parsed = parseEmail(cell);
+    if (!parsed) {
+      report.invalid_syntax += 1;
+      rejected.push({ email: cell.trim().slice(0, 320), verdict: 'invalid_syntax' });
+      await flushRejected();
+      continue;
+    }
+
+    if (isBlockedDomain(parsed.domain)) {
+      report.blocked_domain += 1;
+      rejected.push({ email: parsed.email, verdict: 'blocked_domain' });
+      await flushRejected();
+      continue;
+    }
+
+    if (opts.dropDisposable && isDisposableDomain(parsed.domain)) {
+      report.disposable += 1;
+      rejected.push({ email: parsed.email, verdict: 'disposable' });
+      await flushRejected();
+      continue;
+    }
+
+    if (opts.dropRole && isRoleAddress(parsed.localPart)) {
+      report.role += 1;
+      rejected.push({ email: parsed.email, verdict: 'role' });
+      await flushRejected();
+      continue;
+    }
+
+    const key = dedupeKey(parsed);
+    if (batchDedupe.has(key)) {
+      report.duplicate += 1;
+      rejected.push({ email: parsed.email, verdict: 'duplicate' });
+      await flushRejected();
+      continue;
+    }
+    batchDedupe.add(key);
+
+    let row: Record<string, string> | null = null;
+    if (opts.keepRow) {
+      row = {};
+      opts.columns.forEach((column, i) => {
+        const value = rec[i];
+        if (value !== undefined && value !== '') row![column] = value;
+      });
+    }
+
+    kept.push({
+      email: parsed.email,
+      dedupeKey: key,
+      domain: parsed.domain,
+      group: groupForDomain(parsed.domain),
+      row,
     });
-    const stream = fs.createReadStream(filePath);
+    await flushKept();
+  }
 
-    parser.on('readable', () => {
-      let rec: string[] | null;
-      while ((rec = parser.read() as string[] | null) !== null) {
-        report.totalRows += 1;
-        const cell = rec[emailIdx];
-
-        if (cell === undefined || cell.trim() === '') {
-          report.emptyRows += 1;
-          continue;
-        }
-
-        const parsed = parseEmail(cell);
-        if (!parsed) {
-          report.invalid_syntax += 1;
-          rejected.push({ email: cell.trim().slice(0, 320), verdict: 'invalid_syntax' });
-          flushRejected();
-          continue;
-        }
-
-        const key = dedupeKey(parsed);
-        if (seen.has(key)) {
-          report.duplicate += 1;
-          rejected.push({ email: parsed.email, verdict: 'duplicate' });
-          flushRejected();
-          continue;
-        }
-        seen.add(key);
-
-        if (isBlockedDomain(parsed.domain)) {
-          report.blocked_domain += 1;
-          rejected.push({ email: parsed.email, verdict: 'blocked_domain' });
-          flushRejected();
-          continue;
-        }
-
-        if (opts.dropDisposable && isDisposableDomain(parsed.domain)) {
-          report.disposable += 1;
-          rejected.push({ email: parsed.email, verdict: 'disposable' });
-          flushRejected();
-          continue;
-        }
-
-        if (opts.dropRole && isRoleAddress(parsed.localPart)) {
-          report.role += 1;
-          rejected.push({ email: parsed.email, verdict: 'role' });
-          flushRejected();
-          continue;
-        }
-
-        let row: Record<string, string> | null = null;
-        if (opts.keepRow) {
-          row = {};
-          opts.columns.forEach((c, i) => {
-            const v = rec![i];
-            if (v !== undefined && v !== '') row![c] = v;
-          });
-        }
-
-        kept.push({ email: parsed.email, domain: parsed.domain, row });
-        flushKept();
-        report.kept += 1;
-        domainCounts.set(parsed.domain, (domainCounts.get(parsed.domain) ?? 0) + 1);
-        const g = groupForDomain(parsed.domain);
-        groupCounts.set(g, (groupCounts.get(g) ?? 0) + 1);
-      }
-    });
-
-    parser.on('error', reject);
-    parser.on('end', () => resolve());
-    stream.on('error', reject);
-    stream.pipe(parser);
-  });
-
-  flushKept(true);
-  flushRejected(true);
-
-  report.topDomains = [...domainCounts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 15)
-    .map(([domain, count]) => ({ domain, count }));
-  report.groupCounts = Object.fromEntries(groupCounts) as PrefilterReport['groupCounts'];
+  await flushKept(true);
+  await flushRejected(true);
 
   return { report };
 }

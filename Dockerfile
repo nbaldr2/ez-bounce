@@ -9,10 +9,6 @@ RUN npm run build
 # ---- stage 2: build the server -------------------------------------------
 FROM node:22-bookworm-slim AS server
 WORKDIR /srv
-# better-sqlite3 needs a toolchain if no prebuild matches this platform.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 make g++ \
- && rm -rf /var/lib/apt/lists/*
 COPY server/package*.json ./
 RUN npm ci
 COPY server/ ./
@@ -24,21 +20,17 @@ ENV NODE_ENV=production
 WORKDIR /srv
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 make g++ curl \
+ && apt-get install -y --no-install-recommends curl \
  && rm -rf /var/lib/apt/lists/*
 
 COPY server/package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
-
-# Drop the toolchain again once the native module is compiled.
-RUN apt-get purge -y python3 make g++ && apt-get autoremove -y
 
 COPY --from=server /srv/dist ./dist
 COPY --from=web /web/dist ./web-dist
 
 ENV WEB_DIST=/srv/web-dist \
     DATA_DIR=/data \
-    SQLITE_PATH=/data/ezdebounce.db \
     UPLOAD_TMP_DIR=/data/tmp \
     PORT=3000
 

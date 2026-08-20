@@ -5,10 +5,9 @@ import { Router } from 'express';
 import multer from 'multer';
 import { z } from 'zod';
 import { config } from '../config.js';
-import { db } from '../db.js';
+import { execute, query, transaction, type UploadRow } from '../db.js';
 import { prefilterCsv, scanCsv } from '../lib/prefilter.js';
 import type { KeptAddress, RejectedAddress } from '../lib/prefilter.js';
-import type { UploadRow } from '../db.js';
 
 export const uploadsRouter = Router();
 
@@ -29,10 +28,7 @@ const upload = multer({
       ['text/csv', 'text/plain', 'application/vnd.ms-excel', 'text/tab-separated-values'].includes(
         file.mimetype,
       );
-    if (!ok) {
-      cb(new Error('Only .csv, .tsv and .txt files are accepted'));
-      return;
-    }
+    if (!ok) return cb(new Error('Only .csv, .tsv and .txt files are accepted'));
     cb(null, true);
   },
 });
@@ -42,11 +38,58 @@ function storedPath(uploadId: string): string {
 }
 
 /**
- * POST /api/uploads
- * Accepts the file, scans a sample to detect the email column, and returns the
- * detection result. No SMTP work happens here and nothing is filtered yet — the
- * client shows the detected column for confirmation first.
+ * One SQL statement per batch, not one network round trip per candidate.
+ * `dedupe_key` is unique per upload, making PostgreSQL the source of truth for
+ * exact Gmail alias-aware dedupe at 10M scale.
  */
+async function insertCandidates(
+  uploadId: string,
+  batch: KeptAddress[],
+): Promise<{ inserted: number; duplicates: RejectedAddress[] }> {
+  if (batch.length === 0) return { inserted: 0, duplicates: [] };
+
+  const inserted = await query<{ dedupe_key: string }>(
+    `INSERT INTO candidates (upload_id, email, dedupe_key, domain, provider_group, row_json)
+     SELECT $1, input.email, input.dedupe_key, input.domain, input.provider_group, input.row_json
+     FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
+       AS input(email, dedupe_key, domain, provider_group, row_json)
+     ON CONFLICT (upload_id, dedupe_key) DO NOTHING
+     RETURNING dedupe_key`,
+    [
+      uploadId,
+      batch.map((row) => row.email),
+      batch.map((row) => row.dedupeKey),
+      batch.map((row) => row.domain),
+      batch.map((row) => row.group),
+      batch.map((row) => (row.row ? JSON.stringify(row.row) : null)),
+    ],
+  );
+
+  const insertedKeys = new Set(inserted.map((row) => row.dedupe_key));
+  return {
+    inserted: inserted.length,
+    duplicates: batch
+      .filter((row) => !insertedKeys.has(row.dedupeKey))
+      .map((row) => ({ email: row.email, verdict: 'duplicate' as const })),
+  };
+}
+
+async function insertRejected(uploadId: string, batch: RejectedAddress[]): Promise<void> {
+  if (batch.length === 0) return;
+  await execute(
+    `INSERT INTO rejected (upload_id, email, verdict, row_json)
+     SELECT $1, input.email, input.verdict, NULL
+     FROM UNNEST($2::text[], $3::text[]) AS input(email, verdict)
+     ON CONFLICT (upload_id, email, verdict) DO NOTHING`,
+    [
+      uploadId,
+      batch.map((row) => row.email),
+      batch.map((row) => row.verdict),
+    ],
+  );
+}
+
+/** Uploads a CSV and returns content-driven email-column detection. */
 uploadsRouter.post('/', upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) {
@@ -65,17 +108,17 @@ uploadsRouter.post('/', upload.single('file'), async (req, res, next) => {
       return;
     }
 
-    db.prepare(
+    await execute(
       `INSERT INTO uploads (id, filename, created_at, email_column, columns_json, total_rows, delimiter)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      uploadId,
-      req.file.originalname,
-      Date.now(),
-      scan.emailColumn,
-      JSON.stringify(scan.columns),
-      0,
-      scan.delimiter,
+       VALUES ($1, $2, $3, $4, $5, 0, $6)`,
+      [
+        uploadId,
+        req.file.originalname,
+        Date.now(),
+        scan.emailColumn,
+        JSON.stringify(scan.columns),
+        scan.delimiter,
+      ],
     );
 
     res.status(201).json({
@@ -97,16 +140,14 @@ const analyzeSchema = z.object({
 });
 
 /**
- * POST /api/uploads/:id/analyze
- * Runs the full prefilter pass and stores the surviving candidates.
- * Returns the counts the UI shows *before* the operator commits to a job.
+ * Streams local filters into PostgreSQL in 5k-row batches. The response remains
+ * a preflight report before SMTP verification starts; candidate data never sits
+ * in an in-memory 10M-row array.
  */
 uploadsRouter.post('/:id/analyze', async (req, res, next) => {
   try {
     const uploadId = req.params.id;
-    const row = db.prepare('SELECT * FROM uploads WHERE id = ?').get(uploadId) as
-      | UploadRow
-      | undefined;
+    const [row] = await query<UploadRow>('SELECT * FROM uploads WHERE id = $1', [uploadId]);
     if (!row) {
       res.status(404).json({ error: 'Upload not found' });
       return;
@@ -130,29 +171,10 @@ uploadsRouter.post('/:id/analyze', async (req, res, next) => {
       return;
     }
 
-    // Re-scan only to recover the headerless flag cheaply.
     const scan = await scanCsv(filePath, 50);
-
-    // Replace any previous analysis for this upload.
-    db.prepare('DELETE FROM candidates WHERE upload_id = ?').run(uploadId);
-    db.prepare('DELETE FROM rejected WHERE upload_id = ?').run(uploadId);
-
-    const insCand = db.prepare(
-      'INSERT OR IGNORE INTO candidates (upload_id, email, domain, row_json) VALUES (?, ?, ?, ?)',
-    );
-    const insRej = db.prepare(
-      'INSERT OR IGNORE INTO rejected (upload_id, email, verdict, row_json) VALUES (?, ?, ?, NULL)',
-    );
-
-    // Each batch is one transaction: fast, and bounded memory regardless of how
-    // large the file is.
-    const writeKept = db.transaction((batch: KeptAddress[]) => {
-      for (const c of batch) {
-        insCand.run(uploadId, c.email, c.domain, c.row ? JSON.stringify(c.row) : null);
-      }
-    });
-    const writeRejected = db.transaction((batch: RejectedAddress[]) => {
-      for (const r of batch) insRej.run(uploadId, r.email, r.verdict);
+    await transaction(async (client) => {
+      await client.query('DELETE FROM candidates WHERE upload_id = $1', [uploadId]);
+      await client.query('DELETE FROM rejected WHERE upload_id = $1', [uploadId]);
     });
 
     const outcome = await prefilterCsv(
@@ -166,12 +188,36 @@ uploadsRouter.post('/:id/analyze', async (req, res, next) => {
         dropDisposable: body.dropDisposable,
         keepRow: body.keepColumns,
       },
-      { keep: writeKept, reject: writeRejected },
+      {
+        keep: (batch) => insertCandidates(uploadId, batch),
+        reject: (batch) => insertRejected(uploadId, batch),
+      },
     );
 
-    db.prepare(
-      'UPDATE uploads SET email_column = ?, total_rows = ?, report_json = ? WHERE id = ?',
-    ).run(emailColumn, outcome.report.totalRows, JSON.stringify(outcome.report), uploadId);
+    const [topDomains, groups] = await Promise.all([
+      query<{ domain: string; count: number }>(
+        `SELECT domain, COUNT(*)::bigint AS count
+         FROM candidates WHERE upload_id = $1
+         GROUP BY domain ORDER BY count DESC, domain ASC LIMIT 15`,
+        [uploadId],
+      ),
+      query<{ provider_group: string; count: number }>(
+        `SELECT provider_group, COUNT(*)::bigint AS count
+         FROM candidates WHERE upload_id = $1 GROUP BY provider_group`,
+        [uploadId],
+      ),
+    ]);
+    outcome.report.topDomains = topDomains;
+    outcome.report.groupCounts = Object.fromEntries(
+      groups.map((item) => [item.provider_group, item.count]),
+    );
+
+    await execute(
+      `UPDATE uploads
+       SET email_column = $1, total_rows = $2, report_json = $3
+       WHERE id = $4`,
+      [emailColumn, outcome.report.totalRows, JSON.stringify(outcome.report), uploadId],
+    );
 
     res.json({
       uploadId,
@@ -188,21 +234,23 @@ uploadsRouter.post('/:id/analyze', async (req, res, next) => {
   }
 });
 
-uploadsRouter.get('/:id', (req, res) => {
-  const row = db.prepare('SELECT * FROM uploads WHERE id = ?').get(req.params.id) as
-    | UploadRow
-    | undefined;
-  if (!row) {
-    res.status(404).json({ error: 'Upload not found' });
-    return;
+uploadsRouter.get('/:id', async (req, res, next) => {
+  try {
+    const [row] = await query<UploadRow>('SELECT * FROM uploads WHERE id = $1', [req.params.id]);
+    if (!row) {
+      res.status(404).json({ error: 'Upload not found' });
+      return;
+    }
+    res.json({
+      uploadId: row.id,
+      filename: row.filename,
+      createdAt: row.created_at,
+      emailColumn: row.email_column,
+      columns: JSON.parse(row.columns_json) as string[],
+      totalRows: row.total_rows,
+      report: row.report_json ? JSON.parse(row.report_json) : null,
+    });
+  } catch (err) {
+    next(err);
   }
-  res.json({
-    uploadId: row.id,
-    filename: row.filename,
-    createdAt: row.created_at,
-    emailColumn: row.email_column,
-    columns: JSON.parse(row.columns_json) as string[],
-    totalRows: row.total_rows,
-    report: row.report_json ? JSON.parse(row.report_json) : null,
-  });
 });

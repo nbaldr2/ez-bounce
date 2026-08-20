@@ -58,6 +58,42 @@ services:
     networks:
       - ezd
 
+  # PostgreSQL is the durable source of truth for uploads, candidates, jobs,
+  # and results. These defaults are sized for the 16 GB production VPS; tune
+  # through .env if this compose file is used on a smaller machine.
+  postgres:
+    image: postgres:16-alpine
+    container_name: ezd-postgres
+    restart: unless-stopped
+    shm_size: '${POSTGRES_SHM_SIZE:-2gb}'
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-2GB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-10GB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-1GB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-16MB}
+      - -c
+      - max_wal_size=${POSTGRES_MAX_WAL_SIZE:-4GB}
+      - -c
+      - wal_compression=on
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ezdebounce}
+      POSTGRES_USER: ${POSTGRES_USER:-ezdebounce}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ezd
+
   app:
     build:
       context: .
@@ -67,11 +103,16 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
       reacher:
         condition: service_started
     environment:
       PORT: '3000'
       REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ezdebounce}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ezdebounce}
+      DB_POOL_MAX: ${DB_POOL_MAX:-24}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-60000}
       REACHER_URL: http://reacher:8080
       REACHER_HEADER_SECRET: ${REACHER_HEADER_SECRET:-}
       REACHER_TIMEOUT_MS: ${REACHER_TIMEOUT_MS:-45000}
@@ -120,6 +161,7 @@ services:
 volumes:
   redis-data:
   app-data:
+  postgres-data:
 
 networks:
   ezd:

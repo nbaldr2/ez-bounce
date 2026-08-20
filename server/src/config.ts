@@ -78,7 +78,11 @@ export const config = {
   /** Sent as `x-reacher-secret` when set (matches RCH__HEADER_SECRET on the sidecar). */
   reacherSecret: str('REACHER_HEADER_SECRET', ''),
   dataDir,
-  sqlitePath: str('SQLITE_PATH', path.join(dataDir, 'ezdebounce.db')),
+  /** PostgreSQL is mandatory for high-volume candidate/result storage. */
+  databaseUrl: str('DATABASE_URL', 'postgresql://ezdebounce:ezdebounce@127.0.0.1:5432/ezdebounce'),
+  /** Shared API + workers connection budget. PostgreSQL enforces the real limit. */
+  dbPoolMax: int('DB_POOL_MAX', 24),
+  dbStatementTimeoutMs: int('DB_STATEMENT_TIMEOUT_MS', 60_000),
   uploadTmpDir: str('UPLOAD_TMP_DIR', path.join(dataDir, 'tmp')),
   maxUploadMb: int('MAX_UPLOAD_MB', 250),
   /** Serve the built React app from here when it exists. */

@@ -35,7 +35,7 @@ let concurrencyTimer: NodeJS.Timeout | null = null;
 async function process(job: Job<VerifyJobData>): Promise<void> {
   const { jobId, email, domain, group, attempt } = job.data;
 
-  const parent = getJob(jobId);
+  const parent = await getJob(jobId);
   if (!parent) return; // Job record deleted; drop silently.
 
   if (parent.status === 'cancelled' || (await isCancelled(jobId))) {

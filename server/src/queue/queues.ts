@@ -44,7 +44,7 @@ export const queues: Record<ProviderGroup, Queue<VerifyJobData>> = Object.fromEn
     new Queue<VerifyJobData>(queueName(g), {
       connection,
       defaultJobOptions: {
-        // Keep the tail of finished jobs only; results live in SQLite.
+        // Keep the tail of finished jobs only; results live in PostgreSQL.
         removeOnComplete: { count: 1_000 },
         removeOnFail: { count: 5_000 },
       },

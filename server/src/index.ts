@@ -4,6 +4,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { ZodError } from 'zod';
 import multer from 'multer';
 import { config } from './config.js';
+import { closeDb, databaseHealthy, initDb } from './db.js';
 import { redis } from './redis.js';
 import { reacherHealthy } from './lib/reacher.js';
 import { uploadsRouter } from './routes/uploads.js';
@@ -17,9 +18,10 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '2mb' }));
 
 app.get('/api/health', async (_req, res) => {
-  const [reacher, queues] = await Promise.all([
+  const [reacher, queues, database] = await Promise.all([
     reacherHealthy(),
     allGroupCounts().catch(() => null),
+    databaseHealthy(),
   ]);
   let redisOk = false;
   try {
@@ -28,10 +30,11 @@ app.get('/api/health', async (_req, res) => {
     redisOk = false;
   }
 
-  const ok = reacher.ok && redisOk;
+  const ok = reacher.ok && redisOk && database;
   res.status(ok ? 200 : 503).json({
     ok,
     redis: redisOk,
+    database,
     reacher,
     reacherUrl: config.reacherUrl,
     queues,
@@ -70,6 +73,7 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 async function main(): Promise<void> {
+  await initDb();
   startQueueEvents();
 
   if (config.runWorkers) {
@@ -81,7 +85,7 @@ async function main(): Promise<void> {
   const server = app.listen(config.port, () => {
     console.log(`[api] listening on :${config.port}`);
     console.log(`[api] reacher at ${config.reacherUrl}`);
-    console.log(`[api] sqlite at ${config.sqlitePath}`);
+    console.log('[api] PostgreSQL connected');
   });
 
   // Warn early rather than letting every address fail with a connection error.
@@ -99,6 +103,7 @@ async function main(): Promise<void> {
     server.close();
     await stopWorkers();
     await closeQueues();
+    await closeDb().catch(() => undefined);
     await redis.quit().catch(() => undefined);
     process.exit(0);
   };
