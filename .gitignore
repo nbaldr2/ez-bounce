@@ -1,11 +1,10 @@
 node_modules/
 dist/
-data/
+/data
 .env
 .env.local
 *.log
 .DS_Store
-server/data/
 web/dist/
 *.txt
 main.py
