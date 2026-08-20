@@ -41,8 +41,10 @@ export interface ReacherResponse {
 
 export interface ReacherError {
   type?: string;
-  message?: string;
-  description?: string;
+  // Older backend releases return strings; current releases may return nested
+  // WebDriver error objects such as `{ Cmd: "..." }`.
+  message?: unknown;
+  description?: unknown;
 }
 
 export class ReacherHttpError extends Error {

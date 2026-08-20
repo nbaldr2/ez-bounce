@@ -22,13 +22,32 @@ function isError(v: unknown): v is ReacherError {
   return typeof v === 'object' && v !== null && ('type' in v || 'message' in v);
 }
 
+function textValue(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (Array.isArray(value)) return value.map(textValue).filter(Boolean).join(' ');
+  if (typeof value === 'object' && value !== null) {
+    return Object.values(value).map(textValue).filter(Boolean).join(' ');
+  }
+  return '';
+}
+
 function errorText(res: ReacherResponse): string {
   const parts: string[] = [];
   for (const block of [res.error, res.smtp, res.mx, res.misc]) {
-    if (isError(block)) {
-      if (block.type) parts.push(block.type);
-      if (block.message) parts.push(block.message);
-      if (block.description) parts.push(block.description);
+    const nested =
+      typeof block === 'object' && block !== null && 'error' in block
+        ? (block as { error?: unknown }).error
+        : undefined;
+    for (const candidate of [block, nested]) {
+      if (isError(candidate)) {
+        if (candidate.type) parts.push(candidate.type);
+        const message = textValue(candidate.message);
+        const description = textValue(candidate.description);
+        if (message) parts.push(message);
+        if (description) parts.push(description);
+      }
     }
   }
   return parts.join(' | ');
@@ -67,6 +86,8 @@ const TEMP_FAIL_PATTERNS: ReadonlyArray<[RegExp, Reason]> = [
   [/\bbroken pipe\b/i, 'connection_error'],
   [/\bnetwork (?:is )?unreachable\b/i, 'connection_error'],
   [/\bio error\b/i, 'connection_error'],
+  [/\bdisconnected\b/i, 'connection_error'],
+  [/\bwebdriver\b/i, 'connection_error'],
 ];
 
 /**
