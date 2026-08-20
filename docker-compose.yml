@@ -71,6 +71,8 @@ services:
       REACHER_URL: http://reacher:8080
       REACHER_HEADER_SECRET: ${REACHER_HEADER_SECRET:-}
       REACHER_TIMEOUT_MS: ${REACHER_TIMEOUT_MS:-45000}
+      REACHER_HELLO_NAME: ${REACHER_HELLO_NAME:-emeraldhost.de}
+      REACHER_FROM_EMAIL: ${REACHER_FROM_EMAIL:-verify@vrfy.clinicafloroiu.ro}
 
       # ---- rate limiting -------------------------------------------------
       # Per-provider worker pools. Addresses are bucketed by the MX host they
