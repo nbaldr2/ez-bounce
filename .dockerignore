@@ -3,7 +3,7 @@
 **/.git
 **/.env
 **/.env.*
-**/data
+/data
 **/*.log
 **/.DS_Store
 main.py
