@@ -94,6 +94,10 @@ export const config = {
   /** Skip MX resolution and bucket purely on the address domain. */
   disableMxGrouping: bool('DISABLE_MX_GROUPING', false),
   mxCacheTtlSeconds: int('MX_CACHE_TTL_SECONDS', 24 * 60 * 60),
+  /** Maximum outstanding BullMQ address jobs. Remaining candidates stay in PostgreSQL. */
+  queueWindow: int('QUEUE_WINDOW', 50_000),
+  /** Number of candidates admitted to Redis in one dispatcher pass. */
+  dispatchPage: int('DISPATCH_PAGE', 10_000),
   defaults: {
     groups: groupSettingsFromEnv(),
     /** 30s, then 2m, then 10m, then give up and record `unknown`. */

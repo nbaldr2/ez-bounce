@@ -123,7 +123,7 @@ CSV ─► pre-filter (local, free) ─► MX lookup per domain ─► provider 
                                          ▼
                                   Reacher sidecar ──► recipient MX (port 25)
                                          ▼
-                          classify ─► terminal verdict  ─────► SQLite
+                           classify ─► terminal verdict  ─────► PostgreSQL
                                    └─ 4xx temp-fail ─► requeue w/ backoff
 ```
 
@@ -139,8 +139,9 @@ Runs before any SMTP traffic and shows you the counts before you commit:
 | Disposable | ~500 curated domains, subdomains included. Extend with `DISPOSABLE_DOMAINS_FILE`. |
 | Blocked | Your own deny list via `BLOCKED_DOMAINS`. |
 
-On a 100k-row file this takes about a second and typically removes 10–30% of the
-list — the cheapest verification you will ever do.
+The prefilter streams bounded batches into PostgreSQL, so candidate ingestion
+does not retain an entire list in Node memory. On the 16 GB deployment profile,
+a 100k-row candidate ingest benchmark completes in roughly 8 seconds.
 
 ### Stage 2 — provider pools (the part that matters)
 
@@ -291,9 +292,10 @@ PATCH  /api/settings
 POST   /api/settings/reset
 ```
 
-`POST /api/jobs` returns `202` immediately (measured at 11ms for an 85,000-address
-job); queueing and MX resolution continue in the background. Export streams from
-SQLite with a cursor, so a 100k-row CSV download uses constant memory.
+`POST /api/jobs` returns `202` immediately. Candidates stay in PostgreSQL and a
+bounded dispatcher admits at most `QUEUE_WINDOW` address jobs to Redis at once;
+queueing and MX resolution continue in the background. Export reads PostgreSQL
+through keyset pages, so large CSV downloads use bounded memory.
 
 ### Export modes
 
@@ -325,18 +327,24 @@ cd web    && npm install && npm run dev     # :5173, proxies /api
 
 ## Operational notes
 
-- **Data.** Results live in SQLite on the `app-data` volume; the queue lives in
-  Redis on `redis-data` (AOF enabled, so a part-finished job survives a restart).
-  Back up both, or neither.
+- **Data.** Uploads remain on the `app-data` volume. Candidates, jobs and results
+  live in PostgreSQL on `postgres-data`; Redis queue state lives on `redis-data`
+  with AOF enabled. Back up all three together.
 - **Restarts and crashes are safe.** A running job resumes by itself — no manual
   step. Addresses that were mid-check when the process died are stuck in the
   queue's `active` set until their lock expires, so expect a **~2.5 minute pause
   near the end of the run** before the last few are reclaimed and finished. The
   lock window is derived from `REACHER_TIMEOUT_MS`, and reprocessed addresses are
   de-duplicated, so counts stay exact.
-- **Memory.** Peak RSS on a 100k-row list is ~190 MB, dominated by the dedupe
-  set. A 1 GB VPS is enough for 100k; for much larger lists either split the file
-  or raise `NODE_OPTIONS=--max-old-space-size`.
+- **High-volume jobs.** PostgreSQL enforces dedupe and holds the full candidate
+  set; Redis is capped by `QUEUE_WINDOW` (50k by default), not the full list.
+  This makes multi-million candidate storage feasible, but provider pacing still
+  determines completion time. A 10M Gmail-heavy list on one IP is not a database
+  problem: at the safe 1500ms Gmail pace it can take months.
+- **10M sizing.** An 80 GB disk is usually too small once original CSV row JSON,
+  raw Reacher responses, indexes, WAL and backups are included. For a retained
+  10M-result dataset provision at least 250 GB NVMe, preferably 500 GB, and turn
+  off original-column export for bulk-only uploads where possible.
 - **Reacher is unauthenticated** and will verify anything for anyone who can
   reach it. The compose file keeps it on the internal network with no published
   port. Leave it that way.

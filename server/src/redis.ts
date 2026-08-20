@@ -28,6 +28,7 @@ export const keys = {
   settings: 'ezd:settings',
   jobCounts: (jobId: string) => `ezd:job:${jobId}:counts`,
   jobCancelled: (jobId: string) => `ezd:job:${jobId}:cancelled`,
+  dispatchLock: (jobId: string) => `ezd:job:${jobId}:dispatch-lock`,
   pace: (group: string) => `ezd:pace:${group}`,
   mx: (domain: string) => `ezd:mx:${domain}`,
 };

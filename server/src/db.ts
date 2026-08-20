@@ -28,6 +28,8 @@ export interface JobRow extends QueryResultRow {
   finished_at: number | null;
   settings_json: string;
   prefilter_json: string | null;
+  dispatched: number;
+  dispatch_after: string;
 }
 
 export const pool = new Pool({
@@ -120,7 +122,9 @@ export async function initDb(): Promise<void> {
       started_at     BIGINT,
       finished_at    BIGINT,
       settings_json  TEXT NOT NULL,
-      prefilter_json TEXT
+      prefilter_json TEXT,
+      dispatched     BIGINT NOT NULL DEFAULT 0,
+      dispatch_after TEXT NOT NULL DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS results (
@@ -155,6 +159,13 @@ export async function initDb(): Promise<void> {
       ON results USING GIN (email gin_trgm_ops);
     CREATE INDEX IF NOT EXISTS idx_results_domain_trgm
       ON results USING GIN (domain gin_trgm_ops);
+  `);
+  // Additive migration for databases initialized before bounded dispatch was
+  // introduced. PostgreSQL IF NOT EXISTS keeps this startup-safe and idempotent.
+  await pool.query(`
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS dispatched BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE jobs ADD COLUMN IF NOT EXISTS dispatch_after TEXT NOT NULL DEFAULT '';
+    CREATE INDEX IF NOT EXISTS idx_jobs_dispatch ON jobs (status, dispatched, total);
   `);
 }
 

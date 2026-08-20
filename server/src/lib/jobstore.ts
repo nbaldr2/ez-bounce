@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { config } from '../config.js';
 import { execute, query, type JobRow } from '../db.js';
 import { keys, redis } from '../redis.js';
 import { getSettings } from '../settings.js';
@@ -65,75 +66,98 @@ export async function setJobStatus(id: string, status: JobStatus): Promise<void>
 }
 
 /**
- * Streams candidates in pages. We intentionally resolve MX hosts only for the
- * current page: PostgreSQL/Redis cache the domain result, so a 10M-domain
- * long-tail list never creates a 10M-entry JavaScript Map.
+ * Admits only a bounded number of candidates to Redis. At 10M scale this is
+ * critical: PostgreSQL stores the whole list, while BullMQ holds at most the
+ * configured work window plus delayed retries.
  */
 export async function enqueueJob(jobId: string): Promise<void> {
-  const job = await getJob(jobId);
-  if (!job) throw new Error(`Job ${jobId} not found`);
-
+  if (!(await getJob(jobId))) throw new Error(`Job ${jobId} not found`);
   await setJobStatus(jobId, 'running');
   await redis.del(keys.jobCancelled(jobId));
+  await dispatchMore(jobId);
+}
 
-  const buffers = new Map<ProviderGroup, Array<{ name: string; data: VerifyJobData; opts: object }>>();
-  const CHUNK = 1_000;
-  const PAGE = 1_000;
+/** Replenishes a 50k Redis work window from PostgreSQL when workers drain it. */
+export async function dispatchMore(jobId: string): Promise<void> {
+  const lock = await redis.set(keys.dispatchLock(jobId), '1', 'PX', 10 * 60_000, 'NX');
+  if (lock !== 'OK') return;
 
-  const flush = async (group: ProviderGroup, force = false) => {
-    const items = buffers.get(group);
-    if (!items || items.length === 0 || (!force && items.length < CHUNK)) return;
-    await getQueue(group).addBulk(items);
-    buffers.set(group, []);
-  };
+  try {
+    let job = await getJob(jobId);
+    if (!job || job.status !== 'running' || (await isCancelled(jobId))) return;
 
-  let after = '';
-  for (;;) {
-    const rows = await query<{ email: string; domain: string }>(
-      `SELECT email, domain FROM candidates
-       WHERE upload_id = $1 AND email > $2
-       ORDER BY email LIMIT $3`,
-      [job.upload_id, after, PAGE],
-    );
-    if (rows.length === 0) break;
+    const cached = await redisCounts(jobId);
+    const done = cached.done ?? (await countsFromDb(jobId)).done;
+    let outstanding = Math.max(0, job.dispatched - done);
 
-    const groupByDomain = new Map<string, ProviderGroup>();
-    let cursor = 0;
-    const DNS_CONCURRENCY = Math.min(20, rows.length);
-    await Promise.all(
-      Array.from({ length: DNS_CONCURRENCY }, async () => {
-        for (;;) {
-          const index = cursor++;
-          if (index >= rows.length) return;
-          const domain = rows[index]!.domain;
-          let group: ProviderGroup = 'other';
-          try {
-            group = (await resolveGroup(domain)).group;
-          } catch {
-            // Reacher will independently report no-MX/DNS failures.
+    while (outstanding < config.queueWindow) {
+      const limit = Math.min(config.dispatchPage, config.queueWindow - outstanding);
+      const rows: Array<{ email: string; domain: string }> = await query<{ email: string; domain: string }>(
+        `SELECT email, domain FROM candidates
+         WHERE upload_id = $1 AND email > $2
+         ORDER BY email LIMIT $3`,
+        [job.upload_id, job.dispatch_after, limit],
+      );
+      if (rows.length === 0) break;
+
+      const groupByDomain = new Map<string, ProviderGroup>();
+      let cursor = 0;
+      await Promise.all(
+        Array.from({ length: Math.min(20, rows.length) }, async () => {
+          for (;;) {
+            const index = cursor++;
+            if (index >= rows.length) return;
+            const domain = rows[index]!.domain;
+            let group: ProviderGroup = 'other';
+            try {
+              group = (await resolveGroup(domain)).group;
+            } catch {
+              // Reacher reports DNS failures independently during verification.
+            }
+            groupByDomain.set(domain, group);
           }
-          groupByDomain.set(domain, group);
-        }
-      }),
-    );
+        }),
+      );
 
-    for (const row of rows) {
-      const group = groupByDomain.get(row.domain) ?? 'other';
-      const data: VerifyJobData = { jobId, email: row.email, domain: row.domain, group, attempt: 1 };
-      const items = buffers.get(group) ?? [];
-      items.push({
-        name: 'verify',
-        data,
-        opts: { jobId: `${jobId}:${row.email}:1` },
-      });
-      buffers.set(group, items);
+      const buffers = new Map<ProviderGroup, Array<{ name: string; data: VerifyJobData; opts: object }>>();
+      for (const row of rows) {
+        const group = groupByDomain.get(row.domain) ?? 'other';
+        const items = buffers.get(group) ?? [];
+        items.push({
+          name: 'verify',
+          data: { jobId, email: row.email, domain: row.domain, group, attempt: 1 },
+          opts: { jobId: `${jobId}:${row.email}:1` },
+        });
+        buffers.set(group, items);
+      }
+      await Promise.all(
+        [...buffers.entries()].map(async ([group, items]) => {
+          for (let i = 0; i < items.length; i += 1_000) {
+            await getQueue(group).addBulk(items.slice(i, i + 1_000));
+          }
+        }),
+      );
+
+      const after = rows[rows.length - 1]!.email;
+      await execute(
+        `UPDATE jobs SET dispatched = dispatched + $1, dispatch_after = $2 WHERE id = $3`,
+        [rows.length, after, jobId],
+      );
+      job = { ...job, dispatched: job.dispatched + rows.length, dispatch_after: after };
+      outstanding += rows.length;
+      if (rows.length < limit) break;
     }
-
-    after = rows[rows.length - 1]!.email;
-    await Promise.all(PROVIDER_GROUPS.map((group) => flush(group)));
+  } finally {
+    await redis.del(keys.dispatchLock(jobId)).catch(() => undefined);
   }
+}
 
-  await Promise.all(PROVIDER_GROUPS.map((group) => flush(group, true)));
+/** Called by the worker runtime; does not load every candidate/job into memory. */
+export async function replenishDispatches(): Promise<void> {
+  const jobs = await query<{ id: string }>(
+    `SELECT id FROM jobs WHERE status = 'running' AND dispatched < total ORDER BY created_at LIMIT 100`,
+  );
+  await Promise.all(jobs.map((job) => dispatchMore(job.id)));
 }
 
 export async function requeueWithBackoff(

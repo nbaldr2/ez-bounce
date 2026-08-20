@@ -15,6 +15,7 @@ import {
   isCancelled,
   maybeComplete,
   recordResult,
+  replenishDispatches,
   requeueWithBackoff,
 } from '../lib/jobstore.js';
 import { queueName, type VerifyJobData } from './queues.js';
@@ -213,6 +214,9 @@ export async function startWorkers(): Promise<void> {
             w.concurrency = target;
           }
         }
+        // Keeps Redis bounded: admit the next PostgreSQL page only after the
+        // current queue window drains below its watermark.
+        await replenishDispatches();
       } catch (err) {
         console.warn('[worker] concurrency sync failed:', (err as Error).message);
       }
