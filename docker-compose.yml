@@ -1,0 +1,120 @@
+# ez-debounce — self-hosted bulk email verification
+#
+# Three services: the Reacher SMTP-checking sidecar, Redis (queue + counters),
+# and this app (API + React UI + worker pools in one process).
+#
+#   docker compose up -d --build
+#
+# Only the app publishes a host port. Reacher is reachable only on the internal
+# network: it will happily verify any address for anyone who can reach it, so it
+# must never be exposed to the internet.
+
+services:
+  reacher:
+    image: ${REACHER_IMAGE:-reacherhq/backend:latest}
+    container_name: ezd-reacher
+    restart: unless-stopped
+    environment:
+      # Listen on all interfaces *inside the container* so the app can reach it.
+      RCH__HTTP_HOST: 0.0.0.0
+      RCH__HTTP_PORT: '8080'
+      # HELO name and MAIL FROM used in the SMTP conversation. Both should match
+      # the PTR record of this VPS's outbound IP — Gmail cares about this.
+      RCH__HELLO_NAME: ${REACHER_HELLO_NAME:?set REACHER_HELLO_NAME to this VPS hostname}
+      RCH__FROM_EMAIL: ${REACHER_FROM_EMAIL:?set REACHER_FROM_EMAIL to a real address on your domain}
+      # Optional shared secret; if set, also set REACHER_HEADER_SECRET for the app.
+      RCH__HEADER_SECRET: ${REACHER_HEADER_SECRET:-}
+      RUST_LOG: ${REACHER_LOG:-info}
+    expose:
+      - '8080'
+    # Uncomment to poke Reacher directly from the VPS itself while debugging.
+    # Bound to localhost only — never 0.0.0.0.
+    # ports:
+    #   - '127.0.0.1:8080:8080'
+    networks:
+      - ezd
+
+  redis:
+    image: redis:7-alpine
+    container_name: ezd-redis
+    restart: unless-stopped
+    # Queue state matters: a 100k job that is 60% done should survive a restart.
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory-policy noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ezd
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ezd-app
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      reacher:
+        condition: service_started
+    environment:
+      PORT: '3000'
+      REDIS_URL: redis://redis:6379
+      REACHER_URL: http://reacher:8080
+      REACHER_HEADER_SECRET: ${REACHER_HEADER_SECRET:-}
+      REACHER_TIMEOUT_MS: ${REACHER_TIMEOUT_MS:-45000}
+
+      # ---- rate limiting -------------------------------------------------
+      # Per-provider worker pools. Addresses are bucketed by the MX host they
+      # resolve to, so Google Workspace domains share the gmail pool.
+      #
+      # Gmail: keep this small. concurrency x (1000/delay) is your ceiling
+      # against Google's MX from a single IP. 2 workers @ 1500ms ~= 1.3/sec.
+      GMAIL_CONCURRENCY: ${GMAIL_CONCURRENCY:-2}
+      GMAIL_DELAY_MS: ${GMAIL_DELAY_MS:-1500}
+      MICROSOFT_CONCURRENCY: ${MICROSOFT_CONCURRENCY:-3}
+      MICROSOFT_DELAY_MS: ${MICROSOFT_DELAY_MS:-1000}
+      YAHOO_CONCURRENCY: ${YAHOO_CONCURRENCY:-2}
+      YAHOO_DELAY_MS: ${YAHOO_DELAY_MS:-1200}
+      APPLE_CONCURRENCY: ${APPLE_CONCURRENCY:-2}
+      APPLE_DELAY_MS: ${APPLE_DELAY_MS:-1200}
+      PROTON_CONCURRENCY: ${PROTON_CONCURRENCY:-3}
+      PROTON_DELAY_MS: ${PROTON_DELAY_MS:-500}
+      OTHER_CONCURRENCY: ${OTHER_CONCURRENCY:-8}
+      OTHER_DELAY_MS: ${OTHER_DELAY_MS:-100}
+
+      # Backoff schedule for 4xx temp-fails: 30s, 2m, 10m, then give up and
+      # record the address as "unknown" (never "invalid").
+      RETRY_BACKOFF_MS: ${RETRY_BACKOFF_MS:-30000,120000,600000}
+
+      # ---- prefilter -----------------------------------------------------
+      BLOCKED_DOMAINS: ${BLOCKED_DOMAINS:-}
+      DISPOSABLE_DOMAINS_FILE: ${DISPOSABLE_DOMAINS_FILE:-}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-250}
+      MX_CACHE_TTL_SECONDS: ${MX_CACHE_TTL_SECONDS:-86400}
+    ports:
+      # Bind to localhost and put a TLS-terminating reverse proxy in front, or
+      # change to '3000:3000' to expose it directly (there is no auth built in).
+      - '${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-3000}:3000'
+    volumes:
+      - app-data:/data
+      # Mount a bigger disposable-domain list here if you want one:
+      # - ./disposable.txt:/etc/ezd/disposable.txt:ro
+    networks:
+      - ezd
+
+volumes:
+  redis-data:
+  app-data:
+
+networks:
+  ezd:
+    driver: bridge

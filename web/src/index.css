@@ -1,0 +1,17 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+html,
+body {
+  font-family: var(--font-sans);
+}
+
+/* Tabular numerals keep the live counters from jittering as they tick up. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
